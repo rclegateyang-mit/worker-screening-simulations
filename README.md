@@ -19,19 +19,17 @@ This repository contains tools and simulations for analyzing worker screening me
 
 ```
 worker-screening-simulations/
-├── src/                    # Source code
-│   ├── models/            # Screening model implementations
-│   ├── simulation/        # Simulation engine
-│   ├── estimation/        # Parameter estimation methods
-│   ├── analysis/          # Analysis and visualization tools
-│   └── utils/             # Utility functions
-├── data/                  # Data storage and examples
+├── code/                  # Python source code
+│   ├── simulation.py      # Main simulation module
+│   ├── utils.py           # Utility functions
+│   └── __init__.py        # Package initialization
+├── data/                  # Data files and results
+│   └── README.md          # Data documentation
 ├── notebooks/             # Jupyter notebooks for analysis
-├── tests/                 # Unit tests
-├── config/                # Configuration files
-├── results/               # Simulation results and outputs
-├── docs/                  # Documentation
-└── scripts/               # Utility scripts
+│   └── 01_basic_simulation.ipynb  # Basic simulation example
+├── requirements.txt       # Python dependencies
+├── setup.py              # Package setup
+└── README.md             # This file
 ```
 
 ## Quick Start
@@ -63,13 +61,13 @@ pip install -e .
 
 ```bash
 # Run a basic simulation
-python src/main.py --config config/basic_simulation.yaml
+python code/simulation.py
 
-# Run parameter estimation
-python src/estimation/estimate_parameters.py --data data/sample_data.csv
+# Or run from the main directory
+python -m code.simulation
 
-# Generate analysis report
-python src/analysis/generate_report.py --results results/simulation_001/
+# Open Jupyter notebook for interactive analysis
+jupyter notebook notebooks/01_basic_simulation.ipynb
 ```
 
 ## Models
