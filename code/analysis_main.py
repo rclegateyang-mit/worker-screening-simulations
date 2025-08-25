@@ -149,6 +149,116 @@ def draw_workers(I: int, mean: np.ndarray, std: np.ndarray,
     return df
 
 
+def collect_firm_parameters(J: int, I: int, seed: int, sigma_A: float, sigma_xi: float, 
+                          rho: float, centers: np.ndarray, sds: np.ndarray, 
+                          weights: np.ndarray, cov: np.ndarray) -> pd.DataFrame:
+    """
+    Collect firm DGP parameters into a tidy DataFrame.
+    
+    Args:
+        J: Number of firms
+        I: Number of workers
+        seed: Random seed
+        sigma_A: Standard deviation of logA
+        sigma_xi: Standard deviation of xi
+        rho: Correlation between logA and xi
+        centers: Mixture centers (K x 2)
+        sds: Component standard deviations (K x 2)
+        weights: Mixture weights (K,)
+        cov: 2x2 covariance matrix
+        
+    Returns:
+        DataFrame with parameters in long format
+    """
+    parameters = []
+    
+    # Fundamentals group
+    parameters.extend([
+        {'parameter': 'sigma_A', 'value': sigma_A, 'unit': 'NA', 'group': 'fundamentals', 
+         'description': 'Standard deviation of logA'},
+        {'parameter': 'sigma_xi', 'value': sigma_xi, 'unit': 'NA', 'group': 'fundamentals', 
+         'description': 'Standard deviation of xi'},
+        {'parameter': 'rho_Axi', 'value': rho, 'unit': 'NA', 'group': 'fundamentals', 
+         'description': 'Correlation between logA and xi'},
+        {'parameter': 'cov_11', 'value': cov[0, 0], 'unit': 'NA', 'group': 'fundamentals', 
+         'description': 'Covariance matrix entry (1,1)'},
+        {'parameter': 'cov_12', 'value': cov[0, 1], 'unit': 'NA', 'group': 'fundamentals', 
+         'description': 'Covariance matrix entry (1,2)'},
+        {'parameter': 'cov_22', 'value': cov[1, 1], 'unit': 'NA', 'group': 'fundamentals', 
+         'description': 'Covariance matrix entry (2,2)'}
+    ])
+    
+    # Mixture group - Centers
+    parameters.extend([
+        {'parameter': 'c1_x', 'value': centers[0, 0], 'unit': 'miles', 'group': 'mixture', 
+         'description': 'Component 1 center x-coordinate'},
+        {'parameter': 'c1_y', 'value': centers[0, 1], 'unit': 'miles', 'group': 'mixture', 
+         'description': 'Component 1 center y-coordinate'},
+        {'parameter': 'c2_x', 'value': centers[1, 0], 'unit': 'miles', 'group': 'mixture', 
+         'description': 'Component 2 center x-coordinate'},
+        {'parameter': 'c2_y', 'value': centers[1, 1], 'unit': 'miles', 'group': 'mixture', 
+         'description': 'Component 2 center y-coordinate'},
+        {'parameter': 'c3_x', 'value': centers[2, 0], 'unit': 'miles', 'group': 'mixture', 
+         'description': 'Component 3 center x-coordinate'},
+        {'parameter': 'c3_y', 'value': centers[2, 1], 'unit': 'miles', 'group': 'mixture', 
+         'description': 'Component 3 center y-coordinate'}
+    ])
+    
+    # Mixture group - Component SDs
+    parameters.extend([
+        {'parameter': 'sigma_lx_c1', 'value': sds[0, 0], 'unit': 'sd (miles)', 'group': 'mixture', 
+         'description': 'Component 1 x-direction standard deviation'},
+        {'parameter': 'sigma_ly_c1', 'value': sds[0, 1], 'unit': 'sd (miles)', 'group': 'mixture', 
+         'description': 'Component 1 y-direction standard deviation'},
+        {'parameter': 'sigma_lx_c2', 'value': sds[1, 0], 'unit': 'sd (miles)', 'group': 'mixture', 
+         'description': 'Component 2 x-direction standard deviation'},
+        {'parameter': 'sigma_ly_c2', 'value': sds[1, 1], 'unit': 'sd (miles)', 'group': 'mixture', 
+         'description': 'Component 2 y-direction standard deviation'},
+        {'parameter': 'sigma_lx_c3', 'value': sds[2, 0], 'unit': 'sd (miles)', 'group': 'mixture', 
+         'description': 'Component 3 x-direction standard deviation'},
+        {'parameter': 'sigma_ly_c3', 'value': sds[2, 1], 'unit': 'sd (miles)', 'group': 'mixture', 
+         'description': 'Component 3 y-direction standard deviation'}
+    ])
+    
+    # Mixture group - Weights
+    parameters.extend([
+        {'parameter': 'p1', 'value': weights[0], 'unit': 'NA', 'group': 'mixture', 
+         'description': 'Component 1 mixture weight'},
+        {'parameter': 'p2', 'value': weights[1], 'unit': 'NA', 'group': 'mixture', 
+         'description': 'Component 2 mixture weight'},
+        {'parameter': 'p3', 'value': weights[2], 'unit': 'NA', 'group': 'mixture', 
+         'description': 'Component 3 mixture weight'}
+    ])
+    
+    # Runtime group
+    parameters.extend([
+        {'parameter': 'J', 'value': J, 'unit': 'NA', 'group': 'runtime', 
+         'description': 'Number of firms'},
+        {'parameter': 'I', 'value': I, 'unit': 'NA', 'group': 'runtime', 
+         'description': 'Number of workers'},
+        {'parameter': 'seed', 'value': seed, 'unit': 'NA', 'group': 'runtime', 
+         'description': 'Random seed'}
+    ])
+    
+    return pd.DataFrame(parameters)
+
+
+def save_firm_parameters(params_df: pd.DataFrame, out_dir: str) -> str:
+    """
+    Save firm parameters to CSV file.
+    
+    Args:
+        params_df: Parameters DataFrame
+        out_dir: Output directory
+        
+    Returns:
+        Path to saved file
+    """
+    out_path = Path(out_dir) / "firm_parameters.csv"
+    params_df.to_csv(out_path, index=False)
+    return str(out_path)
+
+
 def plot_spatial(firms: pd.DataFrame, workers: pd.DataFrame, out_path: str) -> None:
     """
     Create spatial distribution plot.
@@ -188,7 +298,7 @@ def plot_spatial(firms: pd.DataFrame, workers: pd.DataFrame, out_path: str) -> N
     plt.close()
 
 
-def main(J: int = 3000, I: int = 20000, seed: int = 123, out_dir: str = "output") -> None:
+def main(J: int = 30, I: int = 20000, seed: int = 123, out_dir: str = "output") -> None:
     """
     Main simulation function.
     
@@ -230,8 +340,13 @@ def main(J: int = 3000, I: int = 20000, seed: int = 123, out_dir: str = "output"
     ])
     
     # Worker location parameters
-    worker_mean = np.array([0, 0])
-    worker_std = np.array([2, np.sqrt(2)])  # std = (2, √2)
+    worker_mean = np.array([0, 2])
+    worker_std = np.array([6, 4])  # std = (2, √2)
+    
+    # Collect and save firm parameters
+    firm_params = collect_firm_parameters(J, I, seed, sA, sXi, rho, centers, sds, weights, cov)
+    params_path = save_firm_parameters(firm_params, out_dir)
+    print(f"Firm parameters saved to: {params_path}")
     
     print(f"Simulating {J} firms and {I} workers...")
     
