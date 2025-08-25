@@ -1,0 +1,620 @@
+#!/usr/bin/env python3
+"""
+Worker Screening Equilibrium Solver
+
+This module implements a fixed-point solver for the worker screening equilibrium
+over wages (w_j) and cutoff costs (c_j) for firms j=1..J.
+
+The solver uses Anderson acceleration with Tikhonov regularization and includes
+comprehensive numerical safeguards for stability.
+"""
+
+import argparse
+import time
+from pathlib import Path
+from typing import Dict, Tuple, Optional, Any
+
+import numpy as np
+import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
+from scipy import special
+
+# Optional numba import
+try:
+    import numba
+    NUMBA_AVAILABLE = True
+except ImportError:
+    NUMBA_AVAILABLE = False
+
+
+def safe_logs(x: np.ndarray, eps: float) -> np.ndarray:
+    """
+    Compute log with safety floor to prevent log(0).
+    
+    Args:
+        x: Input array
+        eps: Safety floor
+        
+    Returns:
+        log(max(x, eps))
+    """
+    return np.log(np.maximum(x, eps))
+
+
+def precompute_bases(xi: np.ndarray, loc_firms: np.ndarray, 
+                    support_points: np.ndarray, gamma: float) -> np.ndarray:
+    """
+    Precompute base intensities B ∈ ℝ^{S×J}.
+    
+    Args:
+        xi: Firm amenity shocks (J,)
+        loc_firms: Firm locations (J, 2)
+        support_points: Worker location support points (S, 2)
+        gamma: Distance decay parameter
+        
+    Returns:
+        Base intensities matrix B (S, J)
+    """
+    # Compute distances D_{s,j} = ||ℓ_s - ℓ_j||_2
+    # Reshape for broadcasting: (S, 1, 2) - (1, J, 2) = (S, J, 2)
+    diff = support_points[:, None, :] - loc_firms[None, :, :]
+    distances = np.linalg.norm(diff, axis=2)  # (S, J)
+    
+    # Compute B_{s,j} = exp(-γ * D_{s,j}) * exp(ξ_j)
+    # Broadcast xi: (1, J) to match distances (S, J)
+    B = np.exp(-gamma * distances) * np.exp(xi[None, :])
+    
+    return B
+
+
+def truncated_normal_column_terms(c_sorted: np.ndarray, mu_s: float, 
+                                sigma_s: float, eps: float) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Compute truncated normal terms ΔF_k and M_k with stable handling.
+    
+    Args:
+        c_sorted: Cutoff costs sorted in ascending order (J,)
+        mu_s: Mean of truncated normal
+        sigma_s: Standard deviation of truncated normal
+        eps: Numerical safety floor
+        
+    Returns:
+        Tuple of (ΔF, M) arrays
+    """
+    J = len(c_sorted)
+    
+    # Compute z-scores
+    z = (c_sorted - mu_s) / sigma_s
+    
+    # Compute CDF and PDF values
+    Phi = special.ndtr(z)  # Φ(z)
+    phi = np.exp(-0.5 * z**2) / np.sqrt(2 * np.pi) * sigma_s  # φ(z) * σ_s
+    
+    # Initialize arrays
+    DeltaF = np.zeros(J)
+    M = np.zeros(J)
+    
+    # Handle k=0 case (z_{-1} = -∞)
+    DeltaF[0] = Phi[0]  # F(c_0) - F(c_{-1}) = F(c_0) - 0
+    if DeltaF[0] > eps:
+        # M_0 = μ_s + σ_s * (φ(z_{-1}) - φ(z_0)) / ΔF_0
+        # Since φ(z_{-1}) = 0, φ(z_{-1}) = 0
+        M[0] = mu_s - sigma_s * phi[0] / DeltaF[0]
+    else:
+        # Fallback to midpoint approximation
+        M[0] = mu_s
+    
+    # Handle k > 0 cases
+    for k in range(1, J):
+        DeltaF[k] = Phi[k] - Phi[k-1]
+        DeltaF[k] = max(DeltaF[k], eps)  # Safety floor
+        
+        if DeltaF[k] > eps:
+            # M_k = μ_s + σ_s * (φ(z_{k-1}) - φ(z_k)) / ΔF_k
+            M[k] = mu_s + sigma_s * (phi[k-1] - phi[k]) / DeltaF[k]
+        else:
+            # Fallback to midpoint approximation
+            M[k] = mu_s
+    
+    return DeltaF, M
+
+
+def fixed_point_map(logw: np.ndarray, logc: np.ndarray, 
+                   A: np.ndarray, xi: np.ndarray, loc_firms: np.ndarray,
+                   support_points: np.ndarray, support_weights: np.ndarray,
+                   mu_s: float, sigma_s: float, alpha: float, beta: float, gamma: float,
+                   B: np.ndarray, eps: float = 1e-12) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Compute one step of the fixed-point map G(x) where x = [logw; logc].
+    
+    Args:
+        logw: Current log wages (J,)
+        logc: Current log cutoff costs (J,)
+        A: Firm TFP (J,)
+        xi: Firm amenity shocks (J,)
+        loc_firms: Firm locations (J, 2)
+        support_points: Worker location support points (S, 2)
+        support_weights: Worker location weights (S,)
+        mu_s: Truncated normal mean
+        sigma_s: Truncated normal std
+        alpha: Wage elasticity parameter
+        beta: Production function parameter
+        gamma: Distance decay parameter
+        B: Precomputed base intensities (S, J)
+        eps: Numerical safety floor
+        
+    Returns:
+        Tuple of (logw_new, logc_new)
+    """
+    J = len(A)
+    S = len(support_points)
+    
+    # Step 1: Convert to levels and sort by c
+    w = np.exp(logw)
+    c = np.exp(logc)
+    
+    # Sort indices by c (ascending)
+    order_idx = np.argsort(c)
+    c_sorted = c[order_idx]
+    
+    # Compute ranks (0-based, ascending)
+    rank = np.zeros(J, dtype=int)
+    rank[order_idx] = np.arange(J)
+    
+    # Step 2: Compute truncated normal terms
+    DeltaF, M = truncated_normal_column_terms(c_sorted, mu_s, sigma_s, eps)
+    
+    # Step 3: Compute NUM = B ⊙ (w^α)[None,:]
+    NUM = B * (w ** alpha)[None, :]  # (S, J)
+    
+    # Step 4: Permute by order_idx
+    NUM_sorted = NUM[:, order_idx]  # (S, J)
+    
+    # Step 5: Cumulative denominators along k
+    DEN = np.cumsum(NUM_sorted, axis=1)  # (S, J)
+    DEN = np.maximum(DEN, eps)  # Safety floor
+    
+    # Step 6: Compute f = support_weights[:,None] / DEN
+    f = support_weights[:, None] / DEN  # (S, J)
+    
+    # Step 7: Compute Gmat = NUM.T @ f (heavy BLAS-3 operation)
+    Gmat = NUM.T @ f  # (J, J)
+    
+    # Step 8: Form column weights
+    vL = DeltaF  # (J,)
+    vS = DeltaF * M  # (J,)
+    
+    # Step 9: Weighted matrices
+    H_L = Gmat * vL[None, :]  # (J, J)
+    H_S = Gmat * vS[None, :]  # (J, J)
+    
+    # Step 10: Row-wise reversed cumulative sums (suffix sums)
+    CumL = np.flip(np.cumsum(np.flip(H_L, axis=1), axis=1), axis=1)  # (J, J)
+    CumS = np.flip(np.cumsum(np.flip(H_S, axis=1), axis=1), axis=1)  # (J, J)
+    
+    # Step 11: Gather L and S using ranks
+    L = CumL[np.arange(J), rank]  # (J,)
+    S = CumS[np.arange(J), rank]  # (J,)
+    
+    # Safety floors
+    L = np.maximum(L, eps)
+    S = np.maximum(S, eps)
+    
+    # Step 12: Update equations (E1') and (E2')
+    t = safe_logs(L, eps) + safe_logs(S, eps)
+    
+    # (E2'): log w_j = log(1-β) + log A_j + (1-β) log(L_j S_j) - log L_j + log(α/(α+1))
+    logw_new = (np.log(1 - beta) + np.log(A) + 
+                (1 - beta) * t - safe_logs(L, eps) + np.log(alpha / (alpha + 1)))
+    
+    # (E1'): log c_j = -log(1-β) + log w_j - log A_j + β log(L_j S_j)
+    logc_new = (-np.log(1 - beta) + logw_new - np.log(A) + beta * t)
+    
+    return logw_new, logc_new
+
+
+def anderson_update(x: np.ndarray, Fx: np.ndarray, store: Dict[str, Any], 
+                   m: int, reg: float, damping: float) -> np.ndarray:
+    """
+    Anderson acceleration update with Tikhonov regularization.
+    
+    Args:
+        x: Current iterate
+        Fx: Function evaluation F(x)
+        store: Storage for Anderson history
+        m: Anderson memory
+        reg: Tikhonov regularization parameter
+        damping: Fallback damping parameter
+        
+    Returns:
+        Updated iterate
+    """
+    if m == 0:
+        # No Anderson acceleration, use simple damping
+        return x + damping * (Fx - x)
+    
+    # Initialize storage if needed
+    if 'dx_history' not in store:
+        store['dx_history'] = []
+        store['dr_history'] = []
+    
+    # Current residual
+    r = Fx - x
+    
+    # Add to history
+    store['dx_history'].append(x.copy())
+    store['dr_history'].append(r.copy())
+    
+    # Keep only last m+1 entries
+    if len(store['dx_history']) > m + 1:
+        store['dx_history'] = store['dx_history'][-m-1:]
+        store['dr_history'] = store['dr_history'][-m-1:]
+    
+    # Need at least 2 points for Anderson
+    if len(store['dx_history']) < 2:
+        return x + damping * r
+    
+    # Build least-squares system
+    k = len(store['dx_history']) - 1
+    dx_mat = np.column_stack([store['dx_history'][i+1] - store['dx_history'][i] 
+                             for i in range(k)])
+    dr_mat = np.column_stack([store['dr_history'][i+1] - store['dr_history'][i] 
+                             for i in range(k)])
+    
+    # Solve least squares with regularization
+    try:
+        # (dr_mat^T dr_mat + reg*I) * theta = dr_mat^T * r
+        A = dr_mat.T @ dr_mat + reg * np.eye(k)
+        b = dr_mat.T @ r
+        theta = np.linalg.solve(A, b)
+        
+        # Anderson update
+        x_new = (store['dx_history'][-1] + 
+                np.sum([theta[i] * store['dx_history'][i] for i in range(k)], axis=0))
+        
+        # Clip update to prevent extreme jumps
+        delta_x = x_new - x
+        max_jump = 5.0
+        if np.max(np.abs(delta_x)) > max_jump:
+            scale = max_jump / np.max(np.abs(delta_x))
+            x_new = x + scale * delta_x
+        
+        return x_new
+        
+    except np.linalg.LinAlgError:
+        # Fallback to damping
+        return x + damping * r
+
+
+def solve_equilibrium(A: np.ndarray, xi: np.ndarray, loc_firms: np.ndarray,
+                     support_points: np.ndarray, support_weights: np.ndarray,
+                     mu_s: float, sigma_s: float, alpha: float, beta: float, gamma: float,
+                     **options) -> Dict[str, Any]:
+    """
+    Solve the worker screening equilibrium.
+    
+    Args:
+        A: Firm TFP (J,)
+        xi: Firm amenity shocks (J,)
+        loc_firms: Firm locations (J, 2)
+        support_points: Worker location support points (S, 2)
+        support_weights: Worker location weights (S,)
+        mu_s: Truncated normal mean
+        sigma_s: Truncated normal std
+        alpha: Wage elasticity parameter
+        beta: Production function parameter
+        gamma: Distance decay parameter
+        **options: Solver options
+        
+    Returns:
+        Dictionary with solution and diagnostics
+    """
+    # Extract options with defaults
+    max_iter = options.get('max_iter', 2000)
+    tol = options.get('tol', 1e-8)
+    damping = options.get('damping', 0.5)
+    anderson_m = options.get('anderson_m', 5)
+    anderson_reg = options.get('anderson_reg', 1e-8)
+    eps = options.get('eps', 1e-12)
+    check_every = options.get('check_every', 10)
+    use_numba = options.get('use_numba', False)
+    return_diagnostics = options.get('return_diagnostics', True)
+    
+    # Validate inputs
+    J = len(A)
+    S = len(support_points)
+    
+    assert len(xi) == J, f"xi length {len(xi)} != J {J}"
+    assert loc_firms.shape == (J, 2), f"loc_firms shape {loc_firms.shape} != ({J}, 2)"
+    assert support_points.shape == (S, 2), f"support_points shape {support_points.shape} != ({S}, 2)"
+    assert len(support_weights) == S, f"support_weights length {len(support_weights)} != S {S}"
+    assert np.all(A > 0), "All A must be positive"
+    assert sigma_s > 0, "sigma_s must be positive"
+    assert alpha > 0, "alpha must be positive"
+    assert 0 < beta < 1, "beta must be in (0, 1)"
+    assert gamma >= 0, "gamma must be nonnegative"
+    assert np.all(support_weights >= 0), "All support_weights must be nonnegative"
+    
+    # Normalize support weights
+    weight_sum = np.sum(support_weights)
+    assert abs(weight_sum - 1.0) < eps, f"support_weights sum to {weight_sum}, not 1.0"
+    support_weights = support_weights / weight_sum
+    
+    # Precompute base intensities
+    start_time = time.time()
+    B = precompute_bases(xi, loc_firms, support_points, gamma)
+    precompute_time = time.time() - start_time
+    
+    # Initialize
+    if 'init_logw' in options and 'init_logc' in options:
+        logw = options['init_logw'].copy()
+        logc = options['init_logc'].copy()
+    else:
+        # Default initialization
+        logw = np.log(1 - beta) + np.log(A) + np.log(alpha / (alpha + 1))
+        logc = -np.log(1 - beta) + logw - np.log(A)
+    
+    # Anderson storage
+    anderson_store = {}
+    
+    # Iteration tracking
+    residuals = []
+    damping_used = []
+    start_iter_time = time.time()
+    
+    # Main iteration loop
+    for iter_num in range(max_iter):
+        iter_start = time.time()
+        
+        # Compute fixed point map
+        logw_new, logc_new = fixed_point_map(
+            logw, logc, A, xi, loc_firms, support_points, support_weights,
+            mu_s, sigma_s, alpha, beta, gamma, B, eps
+        )
+        
+        # Anderson acceleration
+        x = np.concatenate([logw, logc])
+        Fx = np.concatenate([logw_new, logc_new])
+        
+        x_new = anderson_update(x, Fx, anderson_store, anderson_m, anderson_reg, damping)
+        
+        # Extract new values
+        logw_new = x_new[:J]
+        logc_new = x_new[J:]
+        
+        # Compute residual
+        residual = np.max(np.abs(x_new - x))
+        residuals.append(residual)
+        
+        # Check convergence
+        if residual <= tol:
+            converged = True
+            break
+        
+        # Update iterate
+        logw = logw_new.copy()
+        logc = logc_new.copy()
+        
+        # Diagnostics
+        if iter_num % check_every == 0:
+            iter_time = time.time() - iter_start
+            print(f"Iteration {iter_num}: residual = {residual:.2e}, time = {iter_time:.3f}s")
+    
+    else:
+        converged = False
+    
+    total_time = time.time() - start_iter_time
+    
+    # Final evaluation to get L and S
+    w = np.exp(logw)
+    c = np.exp(logc)
+    
+    # Compute final L and S (reuse fixed_point_map logic)
+    order_idx = np.argsort(c)
+    c_sorted = c[order_idx]
+    rank = np.zeros(J, dtype=int)
+    rank[order_idx] = np.arange(J)
+    
+    DeltaF, M = truncated_normal_column_terms(c_sorted, mu_s, sigma_s, eps)
+    
+    NUM = B * (w ** alpha)[None, :]
+    NUM_sorted = NUM[:, order_idx]
+    DEN = np.maximum(np.cumsum(NUM_sorted, axis=1), eps)
+    f = support_weights[:, None] / DEN
+    Gmat = NUM.T @ f
+    
+    vL = DeltaF
+    vS = DeltaF * M
+    H_L = Gmat * vL[None, :]
+    H_S = Gmat * vS[None, :]
+    CumL = np.flip(np.cumsum(np.flip(H_L, axis=1), axis=1), axis=1)
+    CumS = np.flip(np.cumsum(np.flip(H_S, axis=1), axis=1), axis=1)
+    
+    L = np.maximum(CumL[np.arange(J), rank], eps)
+    S = np.maximum(CumS[np.arange(J), rank], eps)
+    
+    # Prepare result
+    result = {
+        'w': w,
+        'c': c,
+        'L': L,
+        'S': S,
+        'logw': logw,
+        'logc': logc,
+        'iters': iter_num + 1,
+        'converged': converged,
+        'residual': residual if converged else residuals[-1],
+        'rank': rank,
+        'order_idx': order_idx
+    }
+    
+    if return_diagnostics:
+        result['diagnostics'] = {
+            'total_time': total_time,
+            'precompute_time': precompute_time,
+            'residuals': residuals,
+            'min_L': np.min(L),
+            'max_L': np.max(L),
+            'min_S': np.min(S),
+            'max_S': np.max(S),
+            'min_w': np.min(w),
+            'max_w': np.max(w),
+            'min_c': np.min(c),
+            'max_c': np.max(c)
+        }
+    
+    return result
+
+
+def create_synthetic_data(J: int = 20, S: int = 8, seed: int = 42) -> Dict[str, np.ndarray]:
+    """
+    Create synthetic data for testing.
+    
+    Args:
+        J: Number of firms
+        S: Number of support points
+        seed: Random seed
+        
+    Returns:
+        Dictionary with synthetic data
+    """
+    rng = np.random.default_rng(seed)
+    
+    # Firm fundamentals
+    A = np.exp(rng.normal(0, 0.3, J))  # Log-normal TFP
+    xi = rng.normal(0, 0.2, J)  # Amenity shocks
+    
+    # Firm locations (random in [-5, 5] x [-5, 5])
+    loc_firms = rng.uniform(-5, 5, (J, 2))
+    
+    # Worker support points (grid)
+    grid_size = int(np.sqrt(S))
+    if grid_size * grid_size != S:
+        # If S is not a perfect square, use random points
+        support_points = rng.uniform(-4, 4, (S, 2))
+    else:
+        x_grid = np.linspace(-4, 4, grid_size)
+        y_grid = np.linspace(-4, 4, grid_size)
+        X, Y = np.meshgrid(x_grid, y_grid)
+        support_points = np.column_stack([X.ravel(), Y.ravel()])
+    
+    # Equal weights
+    support_weights = np.ones(S) / S
+    
+    return {
+        'A': A,
+        'xi': xi,
+        'loc_firms': loc_firms,
+        'support_points': support_points,
+        'support_weights': support_weights
+    }
+
+
+def run_unit_tests():
+    """Run unit tests on synthetic data."""
+    print("Running unit tests...")
+    
+    # Create synthetic data
+    data = create_synthetic_data(J=20, S=8, seed=42)
+    
+    # Parameters
+    mu_s = 0.0
+    sigma_s = 1.0
+    alpha = 1.0
+    beta = 0.5
+    gamma = 0.1
+    
+    # Solve equilibrium
+    start_time = time.time()
+    result = solve_equilibrium(
+        data['A'], data['xi'], data['loc_firms'],
+        data['support_points'], data['support_weights'],
+        mu_s, sigma_s, alpha, beta, gamma,
+        max_iter=500, tol=1e-6, anderson_m=0, damping=0.1, return_diagnostics=True
+    )
+    solve_time = time.time() - start_time
+    
+    # Validation checks
+    print(f"\n=== UNIT TEST RESULTS ===")
+    print(f"Converged: {result['converged']}")
+    print(f"Iterations: {result['iters']}")
+    print(f"Final residual: {result['residual']:.2e}")
+    print(f"Solve time: {solve_time:.3f}s")
+    
+    # Check solution properties
+    L, S, w, c = result['L'], result['S'], result['w'], result['c']
+    
+    print(f"\nSolution bounds:")
+    print(f"  L: [{np.min(L):.4f}, {np.max(L):.4f}]")
+    print(f"  S: [{np.min(S):.4f}, {np.max(S):.4f}]")
+    print(f"  w: [{np.min(w):.4f}, {np.max(w):.4f}]")
+    print(f"  c: [{np.min(c):.4f}, {np.max(c):.4f}]")
+    
+    # Assertions
+    assert result['converged'], "Solver did not converge"
+    assert result['iters'] <= 500, f"Too many iterations: {result['iters']}"
+    assert np.all(L > 0), "Some L <= 0"
+    assert np.all(S > 0), "Some S <= 0"
+    assert np.all(w > 0), "Some w <= 0"
+    assert np.all(c > 0), "Some c <= 0"
+    assert np.all(np.isfinite(L)), "Some L not finite"
+    assert np.all(np.isfinite(S)), "Some S not finite"
+    assert np.all(np.isfinite(w)), "Some w not finite"
+    assert np.all(np.isfinite(c)), "Some c not finite"
+    
+    print("\n✅ All unit tests passed!")
+    
+    # Print diagnostics
+    if 'diagnostics' in result:
+        diag = result['diagnostics']
+        print(f"\nDiagnostics:")
+        print(f"  Total time: {diag['total_time']:.3f}s")
+        print(f"  Precompute time: {diag['precompute_time']:.3f}s")
+        print(f"  Residual history: {len(diag['residuals'])} iterations")
+    
+    return result
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Worker Screening Equilibrium Solver")
+    parser.add_argument("--test", action="store_true", help="Run unit tests")
+    parser.add_argument("--J", type=int, default=20, help="Number of firms (default: 20)")
+    parser.add_argument("--S", type=int, default=8, help="Number of support points (default: 8)")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed (default: 42)")
+    
+    args = parser.parse_args()
+    
+    if args.test:
+        result = run_unit_tests()
+    else:
+        print("Running synthetic example...")
+        data = create_synthetic_data(J=args.J, S=args.S, seed=args.seed)
+        
+        # Parameters
+        mu_s = 0.0
+        sigma_s = 1.0
+        alpha = 1.0
+        beta = 0.5
+        gamma = 0.1
+        
+        # Solve
+        result = solve_equilibrium(
+            data['A'], data['xi'], data['loc_firms'],
+            data['support_points'], data['support_weights'],
+            mu_s, sigma_s, alpha, beta, gamma,
+            max_iter=1000, tol=1e-8, anderson_m=0, damping=0.1, return_diagnostics=True
+        )
+        
+        print(f"Converged: {result['converged']}")
+        print(f"Iterations: {result['iters']}")
+        print(f"Final residual: {result['residual']:.2e}")
+    
+    # Print package versions
+    print(f"\n=== PACKAGE VERSIONS ===")
+    print(f"numpy: {np.__version__}")
+    print(f"pandas: {pd.__version__}")
+    print(f"pyarrow: {pa.__version__}")
+    print(f"numba available: {NUMBA_AVAILABLE}")
+    if NUMBA_AVAILABLE:
+        print(f"numba: {numba.__version__}")

@@ -9,6 +9,9 @@ matplotlib>=3.8.0
 # Data I/O
 pyarrow>=15.0.0
 
+# Optional acceleration
+numba>=0.59.0
+
 # Jupyter notebooks
 jupyter>=1.0.0
 ipykernel>=6.0.0
