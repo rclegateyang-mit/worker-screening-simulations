@@ -1,0 +1,15 @@
+parameter,value,unit,description
+mu_s,0.0,miles,Mean of truncated normal distribution
+sigma_s,1.0,miles,Standard deviation of truncated normal
+alpha,1.0,NA,Wage elasticity parameter
+beta,0.5,NA,Production function parameter
+gamma,0.1,NA,Distance decay parameter
+max_iter,2000.0,NA,Maximum iterations for solver
+tol,1e-08,NA,Convergence tolerance
+damping,0.5,NA,Damping parameter for fixed-point iteration
+anderson_m,5.0,NA,Anderson acceleration memory
+anderson_reg,1e-08,NA,Anderson regularization parameter
+eps,1e-12,NA,Numerical safety floor
+grid_n,40.0,NA,Grid resolution for profit surface plots
+grid_log_span,0.5,NA,Log span for profit surface grid
+max_plots,12.0,NA,Maximum number of profit surface plots
