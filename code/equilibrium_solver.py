@@ -68,10 +68,17 @@ def precompute_bases(xi: np.ndarray, loc_firms: np.ndarray,
     return B
 
 
-def truncated_normal_column_terms(c_sorted: np.ndarray, mu_s: float, 
-                                sigma_s: float, eps: float) -> Tuple[np.ndarray, np.ndarray]:
+def truncated_normal_column_terms(
+    c_sorted: np.ndarray,
+    mu_s: float,
+    sigma_s: float,
+    eps: float
+) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Compute truncated normal terms ΔF_k and M_k with stable handling.
+    Returns (DeltaF, M) for k = 0,...,J using sentinels c_(0)=-inf, c_(J+1)=+inf.
+    DeltaF[k] = Φ(z_k) − Φ(z_{k-1}),  M[k] = μ_s + σ_s * (φ(z_{k-1}) − φ(z_k)) / DeltaF[k],
+    where z_k = (c_(k) − μ_s)/σ_s and Φ,φ are standard normal CDF/PDF.
+    Enforces Φ(z_0)=0 and Φ(z_{J+1})=1 exactly; φ at sentinels is 0.
     
     Args:
         c_sorted: Cutoff costs sorted in ascending order (J,)
@@ -80,42 +87,37 @@ def truncated_normal_column_terms(c_sorted: np.ndarray, mu_s: float,
         eps: Numerical safety floor
         
     Returns:
-        Tuple of (ΔF, M) arrays
+        Tuple of (ΔF, M) arrays with lengths (J+1, J+1)
     """
-    J = len(c_sorted)
+    from scipy.stats import norm
     
-    # Compute z-scores
-    z = (c_sorted - mu_s) / sigma_s
-    
-    # Compute CDF and PDF values
-    Phi = special.ndtr(z)  # Φ(z)
-    phi = np.exp(-0.5 * z**2) / np.sqrt(2 * np.pi) * sigma_s  # φ(z) * σ_s
-    
-    # Initialize arrays
-    DeltaF = np.zeros(J)
-    M = np.zeros(J)
-    
-    # Handle k=0 case (z_{-1} = -∞)
-    DeltaF[0] = Phi[0]  # F(c_0) - F(c_{-1}) = F(c_0) - 0
-    if DeltaF[0] > eps:
-        # M_0 = μ_s + σ_s * (φ(z_{-1}) - φ(z_0)) / ΔF_0
-        # Since φ(z_{-1}) = 0, φ(z_{-1}) = 0
-        M[0] = mu_s - sigma_s * phi[0] / DeltaF[0]
-    else:
-        # Fallback to midpoint approximation
-        M[0] = mu_s
-    
-    # Handle k > 0 cases
-    for k in range(1, J):
-        DeltaF[k] = Phi[k] - Phi[k-1]
-        DeltaF[k] = max(DeltaF[k], eps)  # Safety floor
-        
-        if DeltaF[k] > eps:
-            # M_k = μ_s + σ_s * (φ(z_{k-1}) - φ(z_k)) / ΔF_k
-            M[k] = mu_s + sigma_s * (phi[k-1] - phi[k]) / DeltaF[k]
-        else:
-            # Fallback to midpoint approximation
-            M[k] = mu_s
+    J = int(c_sorted.shape[0])
+    c_pad = np.empty(J + 2, dtype=np.float64)
+    c_pad[0] = -np.inf
+    c_pad[1:-1] = c_sorted
+    c_pad[-1] = np.inf
+
+    z = (c_pad - mu_s) / sigma_s
+
+    Phi = np.empty_like(z)
+    Phi[0] = 0.0
+    Phi[-1] = 1.0
+    if J > 0:
+        Phi[1:-1] = norm.cdf(z[1:-1])
+
+    phi = np.zeros_like(z)
+    if J > 0:
+        phi[1:-1] = norm.pdf(z[1:-1])
+
+    DeltaF = Phi[1:] - Phi[:-1]                # length J+1
+    # Floor tiny masses for numerical stability but preserve unit sum
+    DeltaF = np.maximum(DeltaF, eps)
+    DeltaF = DeltaF / DeltaF.sum()
+
+    # Conditional mean on each interval
+    M = mu_s + sigma_s * (phi[:-1] - phi[1:]) / np.maximum(DeltaF, eps)
+    # Clip extremes when DeltaF is tiny
+    M = np.clip(M, mu_s - 20.0 * sigma_s, mu_s + 20.0 * sigma_s)
     
     return DeltaF, M
 
@@ -175,25 +177,28 @@ def fixed_point_map(logw: np.ndarray, logc: np.ndarray,
     DEN = np.cumsum(NUM_sorted, axis=1)  # (S, J)
     DEN = np.maximum(DEN, eps)  # Safety floor
     
-    # Step 6: Compute f = support_weights[:,None] / DEN
-    f = support_weights[:, None] / DEN  # (S, J)
+    # Expand denominators to cover J+1 intervals
+    DEN_full = np.concatenate([DEN, DEN[:, -1:]], axis=1)  # (S, J+1)
+    
+    # Step 6: Compute f = support_weights[:,None] / DEN_full
+    f = support_weights[:, None] / np.maximum(DEN_full, eps)  # (S, J+1)
     
     # Step 7: Compute Gmat = NUM.T @ f (heavy BLAS-3 operation)
-    Gmat = NUM.T @ f  # (J, J)
+    Gmat = NUM.T @ f  # (J, J+1)
     
     # Step 8: Form column weights
-    vL = DeltaF  # (J,)
-    vS = DeltaF * M  # (J,)
+    vL = DeltaF  # (J+1,)
+    vS = DeltaF * M  # (J+1,)
     
     # Step 9: Weighted matrices
-    H_L = Gmat * vL[None, :]  # (J, J)
-    H_S = Gmat * vS[None, :]  # (J, J)
+    H_L = Gmat * vL[None, :]  # (J, J+1)
+    H_S = Gmat * vS[None, :]  # (J, J+1)
     
-    # Step 10: Row-wise reversed cumulative sums (suffix sums)
-    CumL = np.flip(np.cumsum(np.flip(H_L, axis=1), axis=1), axis=1)  # (J, J)
-    CumS = np.flip(np.cumsum(np.flip(H_S, axis=1), axis=1), axis=1)  # (J, J)
+    # Step 10: Row-wise reversed cumulative sums (suffix sums) across interval index k
+    CumL = np.flip(np.cumsum(np.flip(H_L, axis=1), axis=1), axis=1)  # (J, J+1)
+    CumS = np.flip(np.cumsum(np.flip(H_S, axis=1), axis=1), axis=1)  # (J, J+1)
     
-    # Step 11: Gather L and S using ranks
+    # Step 11: Gather L and S using ranks (sum over k >= rank0[j])
     L = CumL[np.arange(J), rank]  # (J,)
     S = CumS[np.arange(J), rank]  # (J,)
     
@@ -421,15 +426,18 @@ def solve_equilibrium(A: np.ndarray, xi: np.ndarray, loc_firms: np.ndarray,
     NUM = B * (w ** alpha)[None, :]
     NUM_sorted = NUM[:, order_idx]
     DEN = np.maximum(np.cumsum(NUM_sorted, axis=1), eps)
-    f = support_weights[:, None] / DEN
-    Gmat = NUM.T @ f
     
-    vL = DeltaF
-    vS = DeltaF * M
-    H_L = Gmat * vL[None, :]
-    H_S = Gmat * vS[None, :]
-    CumL = np.flip(np.cumsum(np.flip(H_L, axis=1), axis=1), axis=1)
-    CumS = np.flip(np.cumsum(np.flip(H_S, axis=1), axis=1), axis=1)
+    # Expand denominators to cover J+1 intervals
+    DEN_full = np.concatenate([DEN, DEN[:, -1:]], axis=1)  # (S, J+1)
+    f = support_weights[:, None] / np.maximum(DEN_full, eps)  # (S, J+1)
+    Gmat = NUM.T @ f  # (J, J+1)
+    
+    vL = DeltaF  # (J+1,)
+    vS = DeltaF * M  # (J+1,)
+    H_L = Gmat * vL[None, :]  # (J, J+1)
+    H_S = Gmat * vS[None, :]  # (J, J+1)
+    CumL = np.flip(np.cumsum(np.flip(H_L, axis=1), axis=1), axis=1)  # (J, J+1)
+    CumS = np.flip(np.cumsum(np.flip(H_S, axis=1), axis=1), axis=1)  # (J, J+1)
     
     L = np.maximum(CumL[np.arange(J), rank], eps)
     S = np.maximum(CumS[np.arange(J), rank], eps)
@@ -562,6 +570,27 @@ def run_unit_tests():
     assert np.all(np.isfinite(S)), "Some S not finite"
     assert np.all(np.isfinite(w)), "Some w not finite"
     assert np.all(np.isfinite(c)), "Some c not finite"
+    
+    # Test truncated normal boundary conventions
+    # Create test data for boundary validation
+    test_c = np.array([0.5, 1.0, 2.0])
+    test_DeltaF, test_M = truncated_normal_column_terms(test_c, mu_s=0.0, sigma_s=1.0, eps=1e-12)
+    
+    # Validation checks for boundary conventions
+    assert test_DeltaF.min() >= 0, "DeltaF has negative values"
+    assert abs(test_DeltaF.sum() - 1.0) <= 1e-12, f"DeltaF sum is {test_DeltaF.sum()}, not 1.0"
+    assert np.isfinite(test_M).all(), "Some M values are not finite"
+    assert len(test_DeltaF) == len(test_c) + 1, f"DeltaF length {len(test_DeltaF)} != J+1 {len(test_c)+1}"
+    assert len(test_M) == len(test_c) + 1, f"M length {len(test_M)} != J+1 {len(test_c)+1}"
+    
+    # Test denominator expansion logic
+    J_test = 3
+    S_test = 4
+    test_NUM_sorted = np.random.rand(S_test, J_test)
+    test_DEN = np.cumsum(test_NUM_sorted, axis=1)
+    test_DEN_full = np.concatenate([test_DEN, test_DEN[:, -1:]], axis=1)
+    assert test_DEN_full.shape == (S_test, J_test + 1), f"DEN_full shape {test_DEN_full.shape} != ({S_test}, {J_test + 1})"
+    assert np.allclose(test_DEN_full[:, -1], test_DEN_full[:, -2]), "Last two columns of DEN_full should be equal"
     
     print("\n✅ All unit tests passed!")
     
